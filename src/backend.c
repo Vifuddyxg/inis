@@ -1,0 +1,116 @@
+#include "backend.h"
+
+#include "backend_swc.h"
+#include "log.h"
+
+void
+inis_backend_init(struct inis_backend *backend, struct inis_server *server)
+{
+	backend->started = false;
+	backend->server = server;
+	backend->display = NULL;
+	backend->sigint_source = NULL;
+	backend->sigterm_source = NULL;
+	backend->ipc_source = NULL;
+	backend->wayland_socket = NULL;
+	backend->wayland_env[0] = '\0';
+	backend->backend_binding_count = 0;
+}
+
+int
+inis_backend_start(struct inis_backend *backend)
+{
+	return inis_backend_swc_start(backend);
+}
+
+int
+inis_backend_run(struct inis_backend *backend)
+{
+	return inis_backend_swc_run(backend);
+}
+
+void
+inis_backend_request_stop(struct inis_backend *backend)
+{
+	inis_backend_swc_request_stop(backend);
+}
+
+void
+inis_backend_finish(struct inis_backend *backend)
+{
+	if (!backend->started)
+		return;
+	inis_backend_swc_finish(backend);
+	backend->started = false;
+	inis_info("backend stopped");
+}
+
+void
+inis_backend_close_window(struct inis_backend *backend,
+    struct inis_window *window)
+{
+	if (window != NULL)
+		inis_backend_swc_close_window(backend, window);
+}
+
+void
+inis_backend_focus_window(struct inis_backend *backend,
+    struct inis_window *window)
+{
+	inis_backend_swc_focus_window(backend, window);
+}
+
+void
+inis_backend_apply_window(struct inis_backend *backend,
+    struct inis_window *window)
+{
+	if (window != NULL)
+		inis_backend_swc_apply_window(backend, window);
+}
+
+void
+inis_backend_set_window_visible(struct inis_backend *backend,
+    struct inis_window *window, bool visible)
+{
+	if (window != NULL)
+		inis_backend_swc_set_window_visible(backend, window, visible);
+}
+
+void
+inis_backend_raise_window(struct inis_backend *backend,
+    struct inis_window *window)
+{
+	if (window != NULL)
+		inis_backend_swc_raise_window(backend, window);
+}
+
+int
+inis_backend_sync_window_geometry(struct inis_backend *backend,
+    struct inis_window *window)
+{
+	if (window == NULL)
+		return -1;
+	return inis_backend_swc_sync_window_geometry(backend, window);
+}
+
+void
+inis_backend_begin_move(struct inis_backend *backend,
+    struct inis_window *window)
+{
+	if (window != NULL)
+		inis_backend_swc_begin_move(backend, window);
+}
+
+void
+inis_backend_begin_resize(struct inis_backend *backend,
+    struct inis_window *window, uint32_t edges)
+{
+	if (window != NULL)
+		inis_backend_swc_begin_resize(backend, window, edges);
+}
+
+void
+inis_backend_reload_bindings(struct inis_backend *backend)
+{
+	inis_backend_swc_reload_bindings(backend);
+}

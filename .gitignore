@@ -1,0 +1,9 @@
+/inis
+/inisctl
+*.o
+*.so
+*.a
+build/
+dist/
+.cache/
+compile_commands.json

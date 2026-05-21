@@ -1,0 +1,70 @@
+#!/bin/sh
+
+set -u
+
+log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/inis"
+mkdir -p "$log_dir"
+exec >>"$log_dir/session.log" 2>&1
+
+echo
+echo "== inis session start: $(date '+%Y-%m-%d %H:%M:%S') =="
+
+# Find inis binary
+if [ -x /usr/local/bin/inis ]; then
+	inis_bin=/usr/local/bin/inis
+elif [ -x "$(dirname -- "$0")/inis" ]; then
+	inis_bin="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/inis"
+else
+	echo "inis-session: inis binary not found; run: sudo make install"
+	exit 1
+fi
+
+# Find swc-launch — must be setuid root in PATH
+if ! command -v swc-launch >/dev/null 2>&1; then
+	_neu_prefix="${INIS_NEU_PREFIX:-$HOME/.local/inis-neu-prefix}"
+	if [ -u "$_neu_prefix/bin/swc-launch" ]; then
+		export PATH="$_neu_prefix/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}"
+	else
+		echo "inis-session: swc-launch not found as setuid root"
+		echo "inis-session: install with: sudo make install-launch"
+		exit 1
+	fi
+fi
+
+# Ensure XDG_RUNTIME_DIR
+if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "${XDG_RUNTIME_DIR:-}" ]; then
+	if [ -d "/run/user/$(id -u)" ] && [ -w "/run/user/$(id -u)" ]; then
+		export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+	else
+		export XDG_RUNTIME_DIR="/tmp/inis-runtime-$(id -u)"
+		mkdir -p "$XDG_RUNTIME_DIR"
+		chmod 700 "$XDG_RUNTIME_DIR"
+	fi
+fi
+
+# Session lock
+lock_dir="$XDG_RUNTIME_DIR/inis-session.lock"
+if ! mkdir "$lock_dir" 2>/dev/null; then
+	old_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+	if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+		echo "inis-session: another session is already running (pid=$old_pid)"
+		exit 1
+	fi
+	rm -rf "$lock_dir"
+	mkdir "$lock_dir"
+fi
+echo "$$" >"$lock_dir/pid"
+trap 'rm -rf "$lock_dir"' EXIT INT TERM
+
+# Session environment
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=inis
+export XDG_SESSION_DESKTOP=inis
+unset WAYLAND_DISPLAY DISPLAY
+
+echo "inis-session: launching $inis_bin via swc-launch"
+
+if command -v dbus-run-session >/dev/null 2>&1; then
+	exec dbus-run-session -- swc-launch -- "$inis_bin"
+fi
+exec swc-launch -- "$inis_bin"

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=inis
+Comment=Unix-style Wayland compositor with a Hyprland-like workflow
+Exec=/usr/local/bin/inis-session
+Type=Application
+DesktopNames=inis
