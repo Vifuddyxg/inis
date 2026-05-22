@@ -38,6 +38,7 @@ struct inis_server {
 	size_t rule_count;
 
 	struct inis_window *focused_window;
+	struct inis_window *pending_focus_window;
 	struct inis_monitor *focused_monitor;
 
 	struct inis_damage damage;
@@ -54,6 +55,8 @@ void inis_server_flush_damage(struct inis_server *server, const char *why);
 int inis_server_focus_window(struct inis_server *server,
     struct inis_window *window);
 int inis_server_focus_next(struct inis_server *server, int direction);
+int inis_server_focus_direction(struct inis_server *server,
+    enum wc_direction direction);
 int inis_server_switch_workspace(struct inis_server *server, const char *name);
 int inis_server_switch_previous_workspace(struct inis_server *server);
 int inis_server_switch_relative_workspace(struct inis_server *server, int delta);
@@ -65,8 +68,11 @@ int inis_server_center_focused(struct inis_server *server);
 int inis_server_move_focused(struct inis_server *server, int dx, int dy);
 int inis_server_resize_focused(struct inis_server *server, int dw, int dh);
 int inis_server_swap_focused(struct inis_server *server, int direction);
+int inis_server_toggle_split(struct inis_server *server);
 int inis_server_begin_mouse_move(struct inis_server *server);
 int inis_server_begin_mouse_resize(struct inis_server *server, uint32_t edges);
+int inis_server_request_fullscreen(struct inis_server *server,
+    struct inis_window *window, void *backend_monitor, bool fullscreen);
 struct inis_monitor *inis_server_add_monitor(struct inis_server *server,
     const char *name, const struct inis_rect *geometry,
     const struct inis_rect *usable, void *backend_monitor);

@@ -22,6 +22,7 @@ LDFLAGS += $(shell $(PKGCONF) --libs-only-L $(PKGS) | sed 's/-L/-Wl,-rpath,/g')
 
 BIN = inis
 CTL = inisctl
+TEST_LAYOUT = test_layout
 SRC = \
 	src/main.c \
 	src/log.c \
@@ -52,11 +53,22 @@ $(BIN): $(OBJ)
 $(CTL): $(CTL_OBJ)
 	$(CC) -o $@ $(CTL_OBJ)
 
+$(TEST_LAYOUT): test_layout.c src/layout.c
+	$(CC) $(CFLAGS) $(WARN) $(STD) -I. -Iinclude -Isrc \
+	    -o $@ test_layout.c src/layout.c
+
+DEPDIR = .deps
+DEPFLAGS = -MMD -MP -MF $(DEPDIR)/$(basename $(notdir $<)).d
+
 .c.o:
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) $(STD) -I. -Iinclude -Isrc -c -o $@ $<
+	@mkdir -p $(DEPDIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) $(STD) $(DEPFLAGS) -I. -Iinclude -Isrc -c -o $@ $<
+
+-include $(wildcard $(DEPDIR)/*.d)
 
 clean:
-	rm -f $(BIN) $(CTL) $(OBJ) $(CTL_OBJ)
+	rm -f $(BIN) $(CTL) $(TEST_LAYOUT) $(OBJ) $(CTL_OBJ)
+	rm -rf $(DEPDIR)
 
 SWC_LAUNCH_SRC ?= $(shell $(PKGCONF) --variable=prefix swc 2>/dev/null)/bin/swc-launch
 

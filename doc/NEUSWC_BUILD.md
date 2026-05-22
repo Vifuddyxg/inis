@@ -127,8 +127,10 @@ The installed binary will show `neuswc=yes` and find libswc via the embedded rpa
 ## Wayland Session
 
 The session file `/usr/share/wayland-sessions/inis.desktop` runs `inis-session`.
-`inis-session` automatically sets `LD_LIBRARY_PATH` from `~/.local/inis-neu-prefix`
-(or `$INIS_NEU_PREFIX` if set). If libswc is in the rpath, this is a no-op.
+`inis-session` uses the installed compositor binary, so update it with
+`sudo make install`. It automatically sets `LD_LIBRARY_PATH` from
+`~/.local/inis-neu-prefix` (or `$INIS_NEU_PREFIX` if set). If libswc is in
+the rpath, this is a no-op.
 
 To verify the installed binary before starting a session:
 

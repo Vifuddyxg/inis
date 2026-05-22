@@ -5,6 +5,10 @@
 #include "log.h"
 #include "render.h"
 
+#if INIS_HAVE_SWC
+#include <swc.h>
+#endif
+
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,6 +106,7 @@ static void
 ignore_sigchld(void)
 {
 	signal(SIGCHLD, SIG_IGN);
+	signal(SIGPIPE, SIG_IGN);
 }
 
 static void
@@ -170,50 +175,173 @@ window_is_focusable(const struct inis_server *server,
 	    (workspace->special && workspace->visible);
 }
 
-static int
-min_int(int a, int b)
+static struct inis_workspace *
+active_workspace_struct(struct inis_server *server)
 {
-	return a < b ? a : b;
+	unsigned int index;
+
+	if (server->monitor_count == 0)
+		return NULL;
+	index = server->monitors[0].active_workspace;
+	if (index >= server->workspace_count)
+		return NULL;
+	return &server->workspaces[index];
 }
 
 static void
-window_default_floating(struct inis_server *server, struct inis_window *window)
+sync_layout_config(struct inis_server *server, struct inis_workspace *workspace)
 {
-	struct inis_rect area = { 0, 0, 800, 600 };
-	int w;
-	int h;
+	struct wc_layout_config *config;
 
-	if (server->monitor_count > window->monitor_index)
-		area = server->monitors[window->monitor_index].usable;
-
-	w = min_int(800, area.w > 0 ? area.w : 800);
-	h = min_int(600, area.h > 0 ? area.h : 600);
-	window->floating.w = w;
-	window->floating.h = h;
-	window->floating.x = area.x + (area.w - w) / 2;
-	window->floating.y = area.y + (area.h - h) / 2;
+	config = &workspace->layout.config;
+	config->outer_gap = server->config.gaps_out;
+	config->inner_gap = server->config.gaps_in;
+	config->border_width = server->config.border_size;
+	config->master_ratio = (float)server->config.master_ratio;
 }
 
-static void
-window_center(struct inis_server *server, struct inis_window *window)
+static bool
+window_should_be_tiled(const struct inis_server *server,
+    const struct inis_window *window)
 {
-	struct inis_rect area = { 0, 0, 800, 600 };
+	if (window == NULL || !window->mapped)
+		return false;
+	if (window->state != INIS_WINDOW_TILED)
+		return false;
+	if (window->workspace_index >= server->workspace_count)
+		return false;
+	return !server->workspaces[window->workspace_index].special;
+}
 
-	if (server->monitor_count > window->monitor_index)
-		area = server->monitors[window->monitor_index].usable;
-	if (window->floating.w <= 0 || window->floating.h <= 0)
-		window_default_floating(server, window);
-	window->floating.x = area.x + (area.w - window->floating.w) / 2;
-	window->floating.y = area.y + (area.h - window->floating.h) / 2;
+static bool
+window_in_special_workspace(const struct inis_server *server,
+    const struct inis_window *window)
+{
+	if (window == NULL || window->workspace_index >= server->workspace_count)
+		return false;
+	return server->workspaces[window->workspace_index].special;
+}
+
+#if INIS_HAVE_SWC
+static struct inis_window *
+find_window_by_swc(struct inis_server *server, const struct swc_window *swc)
+{
+	size_t i;
+
+	if (swc == NULL)
+		return NULL;
+	for (i = 0; i < server->window_count; i++) {
+		if (!server->windows[i].mapped)
+			continue;
+		if (server->windows[i].swc == swc)
+			return &server->windows[i];
+	}
+	return NULL;
+}
+#endif
+
+static void
+sync_window_layout_membership(struct inis_server *server, struct inis_window *window)
+{
+	struct inis_workspace *workspace;
+
+	if (window == NULL)
+		return;
+
+	if (!window_should_be_tiled(server, window)) {
+		if (window->layout_view.workspace != NULL)
+			layout_remove_view(window->layout_view.workspace,
+			    &window->layout_view);
+		return;
+	}
+
+	workspace = &server->workspaces[window->workspace_index];
+	sync_layout_config(server, workspace);
+	if (window->layout_view.workspace != &workspace->layout) {
+		if (window->layout_view.workspace != NULL)
+			layout_remove_view(window->layout_view.workspace,
+			    &window->layout_view);
+		layout_add_view(&workspace->layout, &window->layout_view);
+	}
 }
 
 static struct inis_rect
-window_current_rect(const struct inis_window *window)
+window_current_rect(const struct inis_server *server,
+    const struct inis_window *window)
 {
+	if (window != NULL && window->state == INIS_WINDOW_FULLSCREEN) {
+		if (server->monitor_count > window->monitor_index)
+			return server->monitors[window->monitor_index].geometry;
+		/* Monitor removed while window was fullscreen — use first monitor. */
+		if (server->monitor_count > 0)
+			return server->monitors[0].geometry;
+	}
 	if (window->state == INIS_WINDOW_FLOATING ||
 	    window->state == INIS_WINDOW_FULLSCREEN)
 		return window->floating;
 	return window->tiled;
+}
+
+static struct inis_rect
+window_usable_area(const struct inis_server *server,
+    const struct inis_window *window)
+{
+	if (window != NULL && server->monitor_count > window->monitor_index)
+		return server->monitors[window->monitor_index].usable;
+	return (struct inis_rect){ 0, 0, 800, 600 };
+}
+
+static bool
+window_make_directly_managed(struct inis_server *server,
+    struct inis_window *window)
+{
+	struct inis_rect area;
+
+	area = window_usable_area(server, window);
+	return inis_window_make_floating(window, &area);
+}
+
+static void
+raise_visible_non_tiled_windows(struct inis_server *server)
+{
+	struct inis_window *focused;
+	const struct inis_workspace *workspace;
+	size_t active_workspace;
+	size_t i;
+
+	if (server->monitor_count == 0)
+		return;
+
+	active_workspace = server->monitors[0].active_workspace;
+	focused = server->focused_window;
+
+	for (i = 0; i < server->window_count; i++) {
+		if (!server->windows[i].mapped)
+			continue;
+		if (server->windows[i].workspace_index >= server->workspace_count)
+			continue;
+		if (server->windows[i].state == INIS_WINDOW_TILED)
+			continue;
+		if (&server->windows[i] == focused)
+			continue;
+		if (server->windows[i].workspace_index != active_workspace) {
+			workspace = &server->workspaces[server->windows[i].workspace_index];
+			if (!workspace->special || !workspace->visible)
+				continue;
+		}
+		inis_backend_raise_window(&server->backend, &server->windows[i]);
+	}
+
+	if (focused == NULL || !focused->mapped ||
+	    focused->workspace_index >= server->workspace_count ||
+	    focused->state == INIS_WINDOW_TILED)
+		return;
+	if (focused->workspace_index != active_workspace) {
+		workspace = &server->workspaces[focused->workspace_index];
+		if (!workspace->special || !workspace->visible)
+			return;
+	}
+	inis_backend_raise_window(&server->backend, focused);
 }
 
 static void
@@ -224,12 +352,7 @@ damage_window(struct inis_server *server, const struct inis_window *window,
 
 	if (window == NULL)
 		return;
-	if (window->state == INIS_WINDOW_FLOATING &&
-	    window->sync_geometry_from_backend) {
-		(void)inis_backend_sync_window_geometry(&server->backend,
-		    (struct inis_window *)window);
-	}
-	rect = window_current_rect(window);
+	rect = window_current_rect(server, window);
 	inis_server_mark_damage(server, &rect, reason);
 }
 
@@ -240,6 +363,15 @@ damage_monitor(struct inis_server *server, const struct inis_monitor *monitor,
 	if (monitor == NULL)
 		return;
 	inis_server_mark_damage(server, &monitor->geometry, reason);
+}
+
+static void
+damage_all_monitors(struct inis_server *server, const char *reason)
+{
+	size_t i;
+
+	for (i = 0; i < server->monitor_count; i++)
+		damage_monitor(server, &server->monitors[i], reason);
 }
 
 static void
@@ -272,18 +404,6 @@ mark_damage_on_outputs(struct inis_server *server, const struct inis_rect *rect,
 	}
 }
 
-static void
-window_make_directly_managed(struct inis_server *server,
-    struct inis_window *window)
-{
-	if (window->state == INIS_WINDOW_FULLSCREEN)
-		inis_window_set_fullscreen(window, false);
-	if (window->state == INIS_WINDOW_TILED) {
-		inis_window_set_floating(window, true);
-		window_default_floating(server, window);
-	}
-}
-
 static int
 clamp_int(int value, int min, int max)
 {
@@ -295,27 +415,119 @@ clamp_int(int value, int min, int max)
 }
 
 static void
-sort_windows_by_layout_order(struct inis_window **windows, size_t count)
+center_rect_in_area(struct inis_rect *rect, const struct inis_rect *anchor,
+    const struct inis_rect *area)
+{
+	int min_x, max_x, min_y, max_y;
+
+	if (rect == NULL || anchor == NULL || area == NULL)
+		return;
+
+	rect->x = anchor->x + (anchor->w - rect->w) / 2;
+	rect->y = anchor->y + (anchor->h - rect->h) / 2;
+
+	min_x = area->x;
+	min_y = area->y;
+	max_x = area->x + area->w - rect->w;
+	max_y = area->y + area->h - rect->h;
+	if (max_x < min_x)
+		max_x = min_x;
+	if (max_y < min_y)
+		max_y = min_y;
+
+	rect->x = clamp_int(rect->x, min_x, max_x);
+	rect->y = clamp_int(rect->y, min_y, max_y);
+}
+
+static bool
+sync_transient_window(struct inis_server *server, struct inis_window *window)
+{
+#if INIS_HAVE_SWC
+	struct inis_window *parent;
+	struct inis_rect area;
+	struct inis_rect parent_rect;
+	bool was_transient;
+	bool changed = false;
+	bool placed = false;
+
+	if (window == NULL || window->swc == NULL) {
+		if (window != NULL)
+			window->transient = false;
+		return false;
+	}
+
+	was_transient = window->transient;
+	window->transient = window->swc->parent != NULL;
+	if (!window->transient)
+		return was_transient;
+
+	parent = find_window_by_swc(server, window->swc->parent);
+	if (parent == NULL || !parent->mapped)
+		return was_transient != window->transient;
+
+	if (window->workspace_index != parent->workspace_index) {
+		window->workspace_index = parent->workspace_index;
+		changed = true;
+	}
+	if (window->monitor_index != parent->monitor_index) {
+		window->monitor_index = parent->monitor_index;
+		changed = true;
+	}
+
+	area = window_usable_area(server, parent);
+	if (window->state == INIS_WINDOW_FULLSCREEN) {
+		inis_window_set_fullscreen(window, false);
+		changed = true;
+	}
+	if (window->state != INIS_WINDOW_FLOATING) {
+		if (!inis_window_rect_valid(&window->floating))
+			inis_window_ensure_floating_rect(window, &area);
+		inis_window_set_floating(window, true);
+		changed = true;
+		placed = true;
+	} else if (!inis_window_rect_valid(&window->floating)) {
+		inis_window_ensure_floating_rect(window, &area);
+		changed = true;
+		placed = true;
+	} else if (!was_transient) {
+		placed = true;
+	}
+
+	if (placed) {
+		parent_rect = window_current_rect(server, parent);
+		center_rect_in_area(&window->floating, &parent_rect, &area);
+	}
+
+	return changed;
+#else
+	(void)server;
+	if (window != NULL)
+		window->transient = false;
+	return false;
+#endif
+}
+
+static int
+monitor_index_from_backend(const struct inis_server *server, void *backend_monitor)
 {
 	size_t i;
 
-	for (i = 1; i < count; i++) {
-		struct inis_window *window = windows[i];
-		size_t j = i;
-
-		while (j > 0 &&
-		    windows[j - 1]->layout_order > window->layout_order) {
-			windows[j] = windows[j - 1];
-			j--;
-		}
-		windows[j] = window;
+	if (backend_monitor == NULL)
+		return -1;
+	for (i = 0; i < server->monitor_count; i++) {
+		if (server->monitors[i].swc == backend_monitor)
+			return (int)i;
 	}
+	return -1;
 }
 
 static void
 apply_window_rules(struct inis_server *server, struct inis_window *window)
 {
 	size_t i;
+	struct inis_rect area;
+
+	area = window_usable_area(server, window);
 
 	for (i = 0; i < server->rule_count; i++) {
 		struct inis_rule *rule = &server->rules[i];
@@ -328,8 +540,7 @@ apply_window_rules(struct inis_server *server, struct inis_window *window)
 
 		switch (rule->action) {
 		case INIS_RULE_FLOAT:
-			inis_window_set_floating(window, true);
-			window_default_floating(server, window);
+			(void)inis_window_make_floating(window, &area);
 			break;
 		case INIS_RULE_TILE:
 			inis_window_set_floating(window, false);
@@ -338,27 +549,28 @@ apply_window_rules(struct inis_server *server, struct inis_window *window)
 			inis_window_set_fullscreen(window, true);
 			break;
 		case INIS_RULE_CENTER:
-			inis_window_set_floating(window, true);
-			window_center(server, window);
+			(void)inis_window_make_floating(window, &area);
+			inis_window_center_floating(window, &area);
 			break;
 		case INIS_RULE_WORKSPACE:
 			workspace_index = workspace_get_or_create(server, rule->args,
 			    strncmp(rule->args, "special:", 8) == 0);
-			if (workspace_index >= 0)
+			if (workspace_index >= 0) {
 				window->workspace_index = (unsigned int)workspace_index;
+				if (server->workspaces[workspace_index].special)
+					(void)inis_window_make_floating_centered(window, &area);
+			}
 			break;
 		case INIS_RULE_SIZE:
 			if (sscanf(rule->args, "%d %d", &a, &b) == 2 && a > 0 && b > 0) {
-				inis_window_set_floating(window, true);
+				(void)inis_window_make_floating(window, &area);
 				window->floating.w = a;
 				window->floating.h = b;
 			}
 			break;
 		case INIS_RULE_MOVE:
 			if (sscanf(rule->args, "%d %d", &a, &b) == 2) {
-				inis_window_set_floating(window, true);
-				if (window->floating.w <= 0 || window->floating.h <= 0)
-					window_default_floating(server, window);
+				(void)inis_window_make_floating(window, &area);
 				window->floating.x = a;
 				window->floating.y = b;
 			}
@@ -417,8 +629,12 @@ inis_server_run(struct inis_server *server)
 void
 inis_server_shutdown(struct inis_server *server)
 {
+	size_t i;
+
 	inis_ipc_finish(&server->ipc);
 	inis_backend_finish(&server->backend);
+	for (i = 0; i < server->workspace_count; i++)
+		inis_workspace_finish(&server->workspaces[i]);
 	inis_info("shutdown complete");
 }
 
@@ -488,21 +704,30 @@ inis_server_add_window(struct inis_server *server, const char *app_id,
 	window->workspace_index = 0;
 	window->monitor_index = 0;
 	window->layout_order = server->next_window_order++;
+	window->layout_view.id = window->layout_order;
 	window->mapped = true;
 	window->swc = backend_window;
 
 	if (server->focused_monitor != NULL)
 		window->workspace_index = server->focused_monitor->active_workspace;
 	apply_window_rules(server, window);
+	(void)sync_transient_window(server, window);
+	sync_window_layout_membership(server, window);
 	if (window->workspace_index < server->workspace_count)
 		server->workspaces[window->workspace_index].window_count++;
 
 	inis_info("window added: app_id=%s title=%s",
 	    window->app_id, window->title);
 	damage_window(server, window, "window-add");
-	inis_server_arrange(server);
-	inis_server_focus_window(server, window);
-	inis_server_flush_damage(server, "window-add");
+	/*
+	 * Defer arrange to the next event-loop idle.  Calling
+	 * inis_server_arrange here (inside swc's new_window callback) would
+	 * invoke swc_window_set_geometry on already-shown windows before they
+	 * have acked their first configure.  Sending a second configure while
+	 * a configure is still pending corrupts xdg_shell state and crashes
+	 * swc — reproducible when two windows are opened within ~1 second.
+	 */
+	inis_backend_schedule_arrange(&server->backend);
 	return window;
 }
 
@@ -522,48 +747,72 @@ inis_server_remove_window(struct inis_server *server, struct inis_window *window
 	    server->workspaces[window->workspace_index].window_count > 0)
 		server->workspaces[window->workspace_index].window_count--;
 
+	if (window->layout_view.workspace != NULL)
+		layout_remove_view(window->layout_view.workspace,
+		    &window->layout_view);
+
 	damage_window(server, window, "window-remove");
 	if (server->focused_window == window)
 		server->focused_window = NULL;
+	if (server->pending_focus_window == window)
+		server->pending_focus_window = NULL;
 
 	window->mapped = false;
 	window->focused = false;
 	window->swc = NULL;
 
-	if (server->focused_window == NULL) {
-		for (i = server->window_count; i > 0; i--) {
-			if (window_is_focusable(server, &server->windows[i - 1])) {
-				inis_server_focus_window(server, &server->windows[i - 1]);
-				break;
-			}
-		}
-	}
+	/*
+	 * Do NOT try to re-focus another window here.  When a multi-window
+	 * client exits, libwayland fires all destroy callbacks synchronously.
+	 * Any candidate window might belong to the same dying client: its
+	 * wl_resources are already freed even though swc != NULL in our
+	 * tracking.  Calling swc_window_focus on such a window makes swc
+	 * write to a freed wl_keyboard resource — use-after-free crash.
+	 *
+	 * Clear the swc-level keyboard focus to NULL (safe — NULL means "no
+	 * focus", no resources accessed) and let arrange_idle_cb pick a new
+	 * focus window after all destroy callbacks in this batch have fired.
+	 */
+	if (server->focused_window == NULL)
+		inis_backend_focus_window(&server->backend, NULL);
 
-	inis_server_arrange(server);
-	inis_server_flush_damage(server, "window-remove");
+	/*
+	 * Defer arrange to the next event-loop idle.  When a multi-window
+	 * client exits (e.g. OBS), libwayland calls our destroy callback for
+	 * every window synchronously inside wl_client_destroy.  Calling
+	 * inis_server_arrange here would call swc_window_set_geometry on the
+	 * other dying windows before their resources are cleaned up, causing
+	 * use-after-free or reentrancy corruption.  The idle fires after all
+	 * destroy callbacks for this batch complete.
+	 */
+	inis_backend_schedule_arrange(&server->backend);
 }
 
 void
 inis_server_arrange(struct inis_server *server)
 {
-	struct inis_layout layout;
-	struct inis_rect area;
-	struct inis_rect rects[INIS_MAX_WINDOWS];
-	struct inis_window *visible[INIS_MAX_WINDOWS];
-	size_t count = 0;
+	struct inis_workspace *active_ws;
+	struct wc_box area;
 	unsigned int active_workspace = 0;
 	size_t i;
 
 	if (server->monitor_count == 0)
 		return;
 
-	/* repaint entire output so removed/toggled windows leave no ghost */
-	inis_damage_add_rect(&server->monitors[0].damage,
-	    &server->monitors[0].geometry, "arrange");
-	inis_damage_add_rect(&server->damage,
-	    &server->monitors[0].geometry, "arrange");
+	/* repaint all outputs so removed/toggled windows leave no ghost */
+	for (i = 0; i < server->monitor_count; i++) {
+		inis_damage_add_rect(&server->monitors[i].damage,
+		    &server->monitors[i].geometry, "arrange");
+		inis_damage_add_rect(&server->damage,
+		    &server->monitors[i].geometry, "arrange");
+	}
 
 	active_workspace = server->monitors[0].active_workspace;
+	active_ws = active_workspace < server->workspace_count ?
+	    &server->workspaces[active_workspace] : NULL;
+
+	for (i = 0; i < server->workspace_count; i++)
+		sync_layout_config(server, &server->workspaces[i]);
 
 	for (i = 0; i < server->window_count; i++) {
 		struct inis_workspace *workspace;
@@ -571,6 +820,8 @@ inis_server_arrange(struct inis_server *server)
 
 		if (!server->windows[i].mapped)
 			continue;
+		(void)sync_transient_window(server, &server->windows[i]);
+		sync_window_layout_membership(server, &server->windows[i]);
 		if (server->windows[i].workspace_index >= server->workspace_count) {
 			inis_backend_set_window_visible(&server->backend, &server->windows[i], false);
 			continue;
@@ -583,75 +834,68 @@ inis_server_arrange(struct inis_server *server)
 			continue;
 		}
 
-		inis_backend_set_window_visible(&server->backend, &server->windows[i], true);
-		if (server->windows[i].workspace_index != active_workspace ||
-		    server->windows[i].state != INIS_WINDOW_TILED)
+		if (server->windows[i].state != INIS_WINDOW_TILED) {
+			inis_backend_set_window_visible(&server->backend, &server->windows[i], true);
 			continue;
-		visible[count++] = &server->windows[i];
+		}
 	}
 
-	layout.master_ratio = server->config.master_ratio;
-	layout.gaps_in = server->config.gaps_in;
-	layout.gaps_out = server->config.gaps_out;
-	area = server->monitors[0].usable;
-	sort_windows_by_layout_order(visible, count);
-	inis_layout_master(&layout, &area, count, rects);
-
-	for (i = 0; i < count; i++) {
-		damage_window(server, visible[i], "layout-old");
-		visible[i]->tiled = rects[i];
-		damage_window(server, visible[i], "layout-new");
-		inis_backend_apply_window(&server->backend, visible[i]);
+	if (active_ws != NULL) {
+		area.x = server->monitors[0].usable.x;
+		area.y = server->monitors[0].usable.y;
+		area.w = server->monitors[0].usable.w;
+		area.h = server->monitors[0].usable.h;
+		if (server->focused_window != NULL &&
+		    server->focused_window->state == INIS_WINDOW_TILED &&
+		    server->focused_window->workspace_index == active_workspace)
+			layout_focus_view(&active_ws->layout,
+			    &server->focused_window->layout_view);
+		layout_arrange(&active_ws->layout, area);
 	}
 
 	for (i = 0; i < server->window_count; i++) {
+		struct inis_rect area;
+
 		if (!server->windows[i].mapped)
 			continue;
 		if (server->windows[i].workspace_index >= server->workspace_count)
 			continue;
+		area = window_usable_area(server, &server->windows[i]);
 		if (server->windows[i].state == INIS_WINDOW_TILED) {
-			if (!server->workspaces[server->windows[i].workspace_index].special)
-				continue;
-			window_default_floating(server, &server->windows[i]);
-			inis_window_set_floating(&server->windows[i], true);
+			if (!window_in_special_workspace(server, &server->windows[i]))
+				goto apply_tiled_window;
+			(void)inis_window_make_floating_centered(&server->windows[i], &area);
 		}
-		if (server->windows[i].state == INIS_WINDOW_FLOATING &&
-		    server->windows[i].sync_geometry_from_backend)
-			(void)inis_backend_sync_window_geometry(&server->backend,
-			    &server->windows[i]);
 		/* ensure floating windows always have a valid rect */
-		if (server->windows[i].state == INIS_WINDOW_FLOATING &&
-		    server->windows[i].floating.w <= 0)
-			window_default_floating(server, &server->windows[i]);
+		if (server->windows[i].state == INIS_WINDOW_FLOATING)
+			inis_window_ensure_floating_rect(&server->windows[i], &area);
+		inis_backend_apply_window(&server->backend, &server->windows[i]);
+		continue;
+
+apply_tiled_window:
+		if (server->windows[i].layout_view.workspace != NULL &&
+		    server->windows[i].workspace_index == active_workspace) {
+			damage_window(server, &server->windows[i], "layout-old");
+			server->windows[i].tiled.x =
+			    server->windows[i].layout_view.pending_geometry.x;
+			server->windows[i].tiled.y =
+			    server->windows[i].layout_view.pending_geometry.y;
+			server->windows[i].tiled.w =
+			    server->windows[i].layout_view.pending_geometry.w;
+			server->windows[i].tiled.h =
+			    server->windows[i].layout_view.pending_geometry.h;
+			damage_window(server, &server->windows[i], "layout-new");
+			inis_backend_set_window_visible(&server->backend,
+			    &server->windows[i],
+			    server->windows[i].layout_view.tiled_visible);
+		} else {
+			inis_backend_set_window_visible(&server->backend,
+			    &server->windows[i], false);
+		}
 		inis_backend_apply_window(&server->backend, &server->windows[i]);
 	}
 
-	/*
-	 * Floating and fullscreen windows must always render above tiled ones.
-	 * Raise non-focused floating windows first, then the focused window last
-	 * so it sits at the very top of the stack.
-	 */
-	for (i = 0; i < server->window_count; i++) {
-		if (!server->windows[i].mapped)
-			continue;
-		if (server->windows[i].workspace_index >= server->workspace_count)
-			continue;
-		if (server->windows[i].state == INIS_WINDOW_TILED)
-			continue;
-		if (&server->windows[i] == server->focused_window)
-			continue;
-		if (server->windows[i].workspace_index != active_workspace) {
-			const struct inis_workspace *ws =
-			    &server->workspaces[server->windows[i].workspace_index];
-			if (!ws->special || !ws->visible)
-				continue;
-		}
-		inis_backend_raise_window(&server->backend, &server->windows[i]);
-	}
-	if (server->focused_window != NULL &&
-	    server->focused_window->mapped &&
-	    server->focused_window->state != INIS_WINDOW_TILED)
-		inis_backend_raise_window(&server->backend, server->focused_window);
+	raise_visible_non_tiled_windows(server);
 }
 
 void
@@ -690,27 +934,49 @@ inis_server_focus_window(struct inis_server *server, struct inis_window *window)
 	if (old != NULL) {
 		damage_window(server, old, "focus-old");
 		old->focused = false;
-		inis_backend_apply_window(&server->backend, old);
+		inis_backend_update_window_style(&server->backend, old);
 	}
 
 	server->focused_window = window;
 	if (window != NULL) {
 		window->focused = true;
+		if (window->state == INIS_WINDOW_TILED &&
+		    window->workspace_index < server->workspace_count)
+			layout_focus_view(&server->workspaces[window->workspace_index].layout,
+			    &window->layout_view);
 		inis_backend_focus_window(&server->backend, window);
 		if (window->state != INIS_WINDOW_TILED)
 			inis_backend_raise_window(&server->backend, window);
 		damage_window(server, window, "focus-new");
-		inis_backend_apply_window(&server->backend, window);
+		inis_backend_update_window_style(&server->backend, window);
 	} else {
 		inis_backend_focus_window(&server->backend, NULL);
 	}
 
+	raise_visible_non_tiled_windows(server);
 	return 0;
 }
 
 int
 inis_server_focus_next(struct inis_server *server, int direction)
 {
+	struct inis_workspace *workspace;
+
+	workspace = active_workspace_struct(server);
+	if (workspace != NULL) {
+		if (direction > 0)
+			layout_cycle_next(&workspace->layout);
+		else
+			layout_cycle_prev(&workspace->layout);
+		if (workspace->layout.focused_view != NULL) {
+			struct inis_window *window =
+			    workspace->layout.focused_view->user_data;
+
+			if (window != NULL)
+				return inis_server_focus_window(server, window);
+		}
+	}
+
 	struct inis_window *candidate = NULL;
 	size_t i;
 	size_t focused_index = INIS_MAX_WINDOWS;
@@ -768,6 +1034,25 @@ inis_server_focus_next(struct inis_server *server, int direction)
 }
 
 int
+inis_server_focus_direction(struct inis_server *server, enum wc_direction direction)
+{
+	struct inis_workspace *workspace;
+	struct inis_window *window;
+
+	workspace = active_workspace_struct(server);
+	if (workspace == NULL)
+		return -1;
+	if (layout_focus_direction(&workspace->layout, direction) != 0)
+		return -1;
+	if (workspace->layout.focused_view == NULL)
+		return -1;
+	window = workspace->layout.focused_view->user_data;
+	if (window == NULL)
+		return -1;
+	return inis_server_focus_window(server, window);
+}
+
+int
 inis_server_switch_workspace(struct inis_server *server, const char *name)
 {
 	int index;
@@ -791,7 +1076,7 @@ inis_server_switch_workspace(struct inis_server *server, const char *name)
 	for (i = 0; i < server->workspace_count; i++)
 		server->workspaces[i].active = i == (size_t)index;
 
-	damage_monitor(server, &server->monitors[0], "workspace-switch");
+	damage_all_monitors(server, "workspace-switch");
 	inis_server_focus_window(server, NULL);
 	for (i = server->window_count; i > 0; i--) {
 		if (server->windows[i - 1].mapped &&
@@ -874,14 +1159,19 @@ inis_server_move_focused_to_workspace(struct inis_server *server,
 	if (window->workspace_index < server->workspace_count &&
 	    server->workspaces[window->workspace_index].window_count > 0)
 		server->workspaces[window->workspace_index].window_count--;
+	if (window->layout_view.workspace != NULL)
+		layout_remove_view(window->layout_view.workspace,
+		    &window->layout_view);
 
 	window->workspace_index = (unsigned int)index;
 	workspace = &server->workspaces[index];
 	workspace->window_count++;
-	if (workspace->special && window->state == INIS_WINDOW_TILED) {
-		inis_window_set_floating(window, true);
-		window_default_floating(server, window);
+	if (workspace->special) {
+		struct inis_rect area = window_usable_area(server, window);
+
+		(void)inis_window_make_floating_centered(window, &area);
 	}
+	sync_window_layout_membership(server, window);
 
 	if (workspace->special) {
 		if (!workspace->visible) {
@@ -926,8 +1216,7 @@ inis_server_toggle_special_workspace(struct inis_server *server, const char *nam
 	workspace->special = true;
 	workspace->visible = !workspace->visible;
 
-	if (server->monitor_count > 0)
-		damage_monitor(server, &server->monitors[0], "special-workspace");
+	damage_all_monitors(server, "special-workspace");
 
 	if (!workspace->visible && server->focused_window != NULL &&
 	    server->focused_window->workspace_index == (unsigned int)index)
@@ -956,12 +1245,15 @@ int
 inis_server_center_focused(struct inis_server *server)
 {
 	struct inis_window *window = server->focused_window;
+	struct inis_rect area;
 
 	if (window == NULL)
 		return -1;
-	window_make_directly_managed(server, window);
+	area = window_usable_area(server, window);
+	if (window_make_directly_managed(server, window))
+		inis_server_arrange(server);
 	damage_window(server, window, "center-old");
-	window_center(server, window);
+	inis_window_center_floating(window, &area);
 	damage_window(server, window, "center-new");
 	inis_backend_apply_window(&server->backend, window);
 	inis_server_flush_damage(server, "centerwindow");
@@ -975,7 +1267,8 @@ inis_server_move_focused(struct inis_server *server, int dx, int dy)
 
 	if (window == NULL)
 		return -1;
-	window_make_directly_managed(server, window);
+	if (window_make_directly_managed(server, window))
+		inis_server_arrange(server);
 	damage_window(server, window, "move-old");
 	window->floating.x += dx;
 	window->floating.y += dy;
@@ -989,21 +1282,38 @@ int
 inis_server_resize_focused(struct inis_server *server, int dw, int dh)
 {
 	struct inis_window *window = server->focused_window;
-	struct inis_rect area = { 0, 0, 800, 600 };
+	struct inis_rect area;
 	int max_w;
 	int max_h;
+	int magnitude;
+	float delta;
 
 	if (window == NULL)
 		return -1;
-	window_make_directly_managed(server, window);
+	if (window->state == INIS_WINDOW_TILED) {
+		magnitude = abs(dw) >= abs(dh) ? dw : dh;
+		if (magnitude == 0)
+			return -1;
+		delta = magnitude > 0 ? 0.05f : -0.05f;
+		if (window->workspace_index < server->workspace_count) {
+			layout_focus_view(&server->workspaces[window->workspace_index].layout,
+			    &window->layout_view);
+			layout_resize_focused(
+			    &server->workspaces[window->workspace_index].layout, delta);
+			inis_server_arrange(server);
+			inis_server_flush_damage(server, "resizeactive");
+			return 0;
+		}
+	}
+	if (window_make_directly_managed(server, window))
+		inis_server_arrange(server);
 	damage_window(server, window, "resize-old");
-	if (server->monitor_count > window->monitor_index)
-		area = server->monitors[window->monitor_index].usable;
+	area = window_usable_area(server, window);
 
 	max_w = area.w > 0 ? area.w : 8192;
 	max_h = area.h > 0 ? area.h : 8192;
-	window->floating.w = clamp_int(window->floating.w + dw, 80, max_w);
-	window->floating.h = clamp_int(window->floating.h + dh, 60, max_h);
+	window->floating.w = clamp_int(window->floating.w + dw, 50, max_w);
+	window->floating.h = clamp_int(window->floating.h + dh, 50, max_h);
 	damage_window(server, window, "resize-new");
 	inis_backend_apply_window(&server->backend, window);
 	inis_server_flush_damage(server, "resizeactive");
@@ -1014,10 +1324,8 @@ int
 inis_server_swap_focused(struct inis_server *server, int direction)
 {
 	struct inis_window *focused = server->focused_window;
-	struct inis_window *candidate = NULL;
 	unsigned int active_workspace;
-	unsigned int tmp_order;
-	size_t i;
+	struct inis_workspace *workspace;
 
 	if (focused == NULL || focused->state != INIS_WINDOW_TILED)
 		return -1;
@@ -1027,41 +1335,29 @@ inis_server_swap_focused(struct inis_server *server, int direction)
 	active_workspace = server->monitors[0].active_workspace;
 	if (focused->workspace_index != active_workspace)
 		return -1;
-	if (direction == 0)
-		direction = 1;
 
-	for (i = 0; i < server->window_count; i++) {
-		struct inis_window *window = &server->windows[i];
-
-		if (!window->mapped || window == focused)
-			continue;
-		if (window->workspace_index != active_workspace ||
-		    window->state != INIS_WINDOW_TILED)
-			continue;
-
-		if (direction > 0) {
-			if (window->layout_order <= focused->layout_order)
-				continue;
-			if (candidate == NULL ||
-			    window->layout_order < candidate->layout_order)
-				candidate = window;
-		} else {
-			if (window->layout_order >= focused->layout_order)
-				continue;
-			if (candidate == NULL ||
-			    window->layout_order > candidate->layout_order)
-				candidate = window;
-		}
-	}
-
-	if (candidate == NULL)
-		return -1;
-
-	tmp_order = focused->layout_order;
-	focused->layout_order = candidate->layout_order;
-	candidate->layout_order = tmp_order;
+	workspace = &server->workspaces[active_workspace];
+	layout_focus_view(&workspace->layout, &focused->layout_view);
+	layout_swap_focused_neighbor(&workspace->layout, direction);
 	inis_server_arrange(server);
 	inis_server_flush_damage(server, "swapwindow");
+	return 0;
+}
+
+int
+inis_server_toggle_split(struct inis_server *server)
+{
+	struct inis_window *window = server->focused_window;
+
+	if (window == NULL || window->state != INIS_WINDOW_TILED)
+		return -1;
+	if (window->workspace_index >= server->workspace_count)
+		return -1;
+	layout_focus_view(&server->workspaces[window->workspace_index].layout,
+	    &window->layout_view);
+	layout_toggle_split(&server->workspaces[window->workspace_index].layout);
+	inis_server_arrange(server);
+	inis_server_flush_damage(server, "togglesplit");
 	return 0;
 }
 
@@ -1072,9 +1368,10 @@ inis_server_begin_mouse_move(struct inis_server *server)
 
 	if (window == NULL)
 		return -1;
-	window_make_directly_managed(server, window);
+	if (window_make_directly_managed(server, window))
+		inis_server_arrange(server);
 	damage_window(server, window, "mouse-move");
-	window->sync_geometry_from_backend = true;
+	window->interactive_grab = true;
 	inis_backend_apply_window(&server->backend, window);
 	(void)inis_server_focus_window(server, window);
 	inis_backend_begin_move(&server->backend, window);
@@ -1089,13 +1386,35 @@ inis_server_begin_mouse_resize(struct inis_server *server, uint32_t edges)
 
 	if (window == NULL)
 		return -1;
-	window_make_directly_managed(server, window);
+	if (window_make_directly_managed(server, window))
+		inis_server_arrange(server);
 	damage_window(server, window, "mouse-resize");
-	window->sync_geometry_from_backend = true;
+	window->interactive_grab = true;
 	inis_backend_apply_window(&server->backend, window);
 	(void)inis_server_focus_window(server, window);
 	inis_backend_begin_resize(&server->backend, window, edges);
 	inis_server_flush_damage(server, "resizewindow");
+	return 0;
+}
+
+int
+inis_server_request_fullscreen(struct inis_server *server,
+    struct inis_window *window, void *backend_monitor, bool fullscreen)
+{
+	int monitor_index;
+
+	if (server == NULL || window == NULL || !window->mapped)
+		return -1;
+
+	monitor_index = monitor_index_from_backend(server, backend_monitor);
+	if (monitor_index >= 0)
+		window->monitor_index = (unsigned int)monitor_index;
+
+	inis_window_set_fullscreen(window, fullscreen);
+	inis_server_arrange(server);
+	(void)inis_server_focus_window(server, window);
+	inis_server_flush_damage(server,
+	    fullscreen ? "client-fullscreen-on" : "client-fullscreen-off");
 	return 0;
 }
 

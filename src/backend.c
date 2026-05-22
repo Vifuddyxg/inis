@@ -12,9 +12,18 @@ inis_backend_init(struct inis_backend *backend, struct inis_server *server)
 	backend->sigint_source = NULL;
 	backend->sigterm_source = NULL;
 	backend->ipc_source = NULL;
+	backend->arrange_idle = NULL;
+	backend->arrange_retry_timer = NULL;
+	backend->grab_timer = NULL;
 	backend->wayland_socket = NULL;
 	backend->wayland_env[0] = '\0';
 	backend->backend_binding_count = 0;
+	backend->focus_retry_timer = NULL;
+	backend->grab_mode = INIS_BACKEND_GRAB_NONE;
+	backend->grab_window = NULL;
+	backend->grab_start_cx_fixed = 0;
+	backend->grab_start_cy_fixed = 0;
+	backend->grab_initial_rect = (struct inis_rect){ 0, 0, 0, 0 };
 }
 
 int
@@ -61,6 +70,14 @@ inis_backend_focus_window(struct inis_backend *backend,
 }
 
 void
+inis_backend_update_window_style(struct inis_backend *backend,
+    struct inis_window *window)
+{
+	if (window != NULL)
+		inis_backend_swc_update_window_style(backend, window);
+}
+
+void
 inis_backend_apply_window(struct inis_backend *backend,
     struct inis_window *window)
 {
@@ -84,15 +101,6 @@ inis_backend_raise_window(struct inis_backend *backend,
 		inis_backend_swc_raise_window(backend, window);
 }
 
-int
-inis_backend_sync_window_geometry(struct inis_backend *backend,
-    struct inis_window *window)
-{
-	if (window == NULL)
-		return -1;
-	return inis_backend_swc_sync_window_geometry(backend, window);
-}
-
 void
 inis_backend_begin_move(struct inis_backend *backend,
     struct inis_window *window)
@@ -113,4 +121,10 @@ void
 inis_backend_reload_bindings(struct inis_backend *backend)
 {
 	inis_backend_swc_reload_bindings(backend);
+}
+
+void
+inis_backend_schedule_arrange(struct inis_backend *backend)
+{
+	inis_backend_swc_schedule_arrange(backend);
 }

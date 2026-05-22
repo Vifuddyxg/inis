@@ -32,7 +32,8 @@ USE_NEUSWC=1 ./install-inis-session.sh
 ```
 
 Then select `inis` in the login manager. The session wrapper logs to
-`~/.local/state/inis/session.log`.
+`~/.local/state/inis/session.log` and uses the installed compositor binary
+from `/usr/local/bin/inis`.
 
 For a temporary neuswc stack built by `build-neuswc.sh`:
 
@@ -46,8 +47,9 @@ For a cleaner greeter setup, install neuwld/neuswc into `/usr/local`, then:
 sudo make USE_NEUSWC=1 install
 ```
 
-Plain `sudo make install` intentionally refuses to install a greeter session
-without a Wayland backend.
+Update the main compositor binary with `sudo make install`. Avoid launching
+`./inis` or `~/.local/bin/inis` from the session path; the greeter/session
+wrapper is wired to use the installed binary.
 
 Probe backend dependencies:
 

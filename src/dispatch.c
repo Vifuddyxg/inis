@@ -168,25 +168,32 @@ dispatch_closewindow(struct inis_server *server, const char *args)
 static void
 dispatch_togglefloating(struct inis_server *server, const char *args)
 {
-	bool make_floating;
+	struct inis_window *window;
+	struct inis_rect area;
+	bool special;
+	bool transient;
 
 	(void)args;
 	if (server->focused_window == NULL)
 		return;
-	make_floating = server->focused_window->state != INIS_WINDOW_FLOATING;
-	if (make_floating) {
-		/*
-		 * Reset floating rect to zero so arrange() calls
-		 * window_default_floating(), which centres the window
-		 * at a compact default size.  Without this, the window
-		 * keeps its tiled dimensions and just detaches in place.
-		 */
-		server->focused_window->floating.w = 0;
-		server->focused_window->floating.h = 0;
+	window = server->focused_window;
+	special = window->workspace_index < server->workspace_count &&
+	    server->workspaces[window->workspace_index].special;
+	transient = window->transient;
+	if (server->monitor_count > window->monitor_index)
+		area = server->monitors[window->monitor_index].usable;
+	else
+		area = (struct inis_rect){ 0, 0, 800, 600 };
+	if (special || transient) {
+		if (!inis_window_make_floating_centered(window, &area))
+			inis_window_center_floating(window, &area);
+	} else if (window->state == INIS_WINDOW_FLOATING) {
+		inis_window_set_floating(window, false);
+	} else if (!inis_window_make_floating_centered(window, &area)) {
+		return;
 	}
-	inis_window_set_floating(server->focused_window, make_floating);
 	inis_server_arrange(server);
-	(void)inis_server_focus_window(server, server->focused_window);
+	(void)inis_server_focus_window(server, window);
 	inis_server_flush_damage(server, "togglefloating");
 }
 
@@ -196,10 +203,8 @@ dispatch_fullscreen(struct inis_server *server, const char *args)
 	(void)args;
 	if (server->focused_window == NULL)
 		return;
-	inis_window_set_fullscreen(server->focused_window,
+	(void)inis_server_request_fullscreen(server, server->focused_window, NULL,
 	    server->focused_window->state != INIS_WINDOW_FULLSCREEN);
-	inis_server_arrange(server);
-	inis_server_flush_damage(server, "fullscreen");
 }
 
 static int
@@ -228,6 +233,21 @@ dispatch_moveactive(struct inis_server *server, const char *args)
 		inis_warn("moveactive requires: DX DY");
 		return;
 	}
+
+	/*
+	 * In tiling mode: move = swap position with the adjacent tiled window
+	 * in the requested direction (positive dx/dy → next, negative → prev).
+	 * This keeps the window tiled and never converts it to floating.
+	 * In floating/fullscreen mode: move by pixel delta as before.
+	 */
+	if (server->focused_window != NULL &&
+	    server->focused_window->state == INIS_WINDOW_TILED) {
+		int direction = (dx > 0 || dy > 0) ? 1 : -1;
+		if (inis_server_swap_focused(server, direction) != 0)
+			inis_debug("moveactive (tiled): no neighbor in this direction");
+		return;
+	}
+
 	if (inis_server_move_focused(server, dx, dy) != 0)
 		inis_debug("moveactive ignored: no focused window");
 }
@@ -269,9 +289,9 @@ dispatch_pseudo(struct inis_server *server, const char *args)
 static void
 dispatch_togglesplit(struct inis_server *server, const char *args)
 {
-	(void)server;
 	(void)args;
-	inis_debug("togglesplit ignored: dwindle split state is not implemented");
+	if (inis_server_toggle_split(server) != 0)
+		inis_debug("togglesplit ignored: no tiled focused window");
 }
 
 static void
@@ -321,13 +341,29 @@ dispatch_previous(struct inis_server *server, const char *args)
 static void
 dispatch_movefocus(struct inis_server *server, const char *args)
 {
-	int direction = 1;
-
-	if (args != NULL &&
-	    (strcmp(args, "left") == 0 || strcmp(args, "up") == 0))
-		direction = -1;
-	if (inis_server_focus_next(server, direction) != 0)
-		inis_debug("movefocus ignored: no focusable window");
+	if (args != NULL) {
+		if (strcmp(args, "left") == 0) {
+			if (inis_server_focus_direction(server, WC_DIRECTION_LEFT) != 0)
+				inis_debug("movefocus left ignored");
+			return;
+		}
+		if (strcmp(args, "right") == 0) {
+			if (inis_server_focus_direction(server, WC_DIRECTION_RIGHT) != 0)
+				inis_debug("movefocus right ignored");
+			return;
+		}
+		if (strcmp(args, "up") == 0) {
+			if (inis_server_focus_direction(server, WC_DIRECTION_UP) != 0)
+				inis_debug("movefocus up ignored");
+			return;
+		}
+		if (strcmp(args, "down") == 0) {
+			if (inis_server_focus_direction(server, WC_DIRECTION_DOWN) != 0)
+				inis_debug("movefocus down ignored");
+			return;
+		}
+	}
+	inis_debug("movefocus ignored: no focusable window");
 }
 
 static void

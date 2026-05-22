@@ -2,6 +2,7 @@
 #define INIS_WINDOW_H
 
 #include "inis.h"
+#include "layout.h"
 
 #if INIS_HAVE_SWC
 struct swc_window;
@@ -27,7 +28,10 @@ struct inis_window {
 	bool urgent;
 	bool no_border;
 	bool no_anim;
-	bool sync_geometry_from_backend;
+	bool was_floating;
+	bool transient;
+	bool interactive_grab;
+	struct wc_view layout_view;
 #if INIS_HAVE_SWC
 	struct swc_window *swc;
 #else
@@ -36,6 +40,15 @@ struct inis_window {
 };
 
 void inis_window_init(struct inis_window *window);
+bool inis_window_rect_valid(const struct inis_rect *rect);
+void inis_window_ensure_floating_rect(struct inis_window *window,
+    const struct inis_rect *usable_area);
+bool inis_window_make_floating(struct inis_window *window,
+    const struct inis_rect *usable_area);
+bool inis_window_make_floating_centered(struct inis_window *window,
+    const struct inis_rect *usable_area);
+void inis_window_center_floating(struct inis_window *window,
+    const struct inis_rect *usable_area);
 void inis_window_set_floating(struct inis_window *window, bool floating);
 void inis_window_set_fullscreen(struct inis_window *window, bool fullscreen);
 

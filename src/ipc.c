@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -62,7 +63,7 @@ inis_ipc_start(struct inis_server *server)
 		close(fd);
 		return -1;
 	}
-	strcpy(addr.sun_path, ipc->socket_path);
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ipc->socket_path);
 	unlink(ipc->socket_path);
 
 	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
@@ -95,11 +96,14 @@ inis_ipc_accept(struct inis_server *server)
 	char buf[INIS_MAX_LINE];
 	ssize_t n;
 
+	struct timeval tv = { 0, 200000 }; /* 200ms — prevents blocking compositor */
+
 	client = accept(server->ipc.fd, NULL, NULL);
 	if (client < 0)
 		return;
 
-	n = recv(client, buf, sizeof(buf) - 1, MSG_DONTWAIT);
+	setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	n = recv(client, buf, sizeof(buf) - 1, 0);
 	if (n <= 0) {
 		close(client);
 		return;

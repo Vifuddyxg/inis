@@ -9,13 +9,14 @@ exec >>"$log_dir/session.log" 2>&1
 echo
 echo "== inis session start: $(date '+%Y-%m-%d %H:%M:%S') =="
 
-# Find inis binary
+# Find inis binary.
+# The session must use the installed binary so updates are done via:
+#   sudo make install
 if [ -x /usr/local/bin/inis ]; then
 	inis_bin=/usr/local/bin/inis
-elif [ -x "$(dirname -- "$0")/inis" ]; then
-	inis_bin="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/inis"
 else
-	echo "inis-session: inis binary not found; run: sudo make install"
+	echo "inis-session: installed inis binary not found"
+	echo "inis-session: install or update it with: sudo make install"
 	exit 1
 fi
 
